@@ -520,7 +520,7 @@ namespace langtable {
 		}
 	}
 
-	public int main (string[] args) {
+	public void init () {
 		keyboards_db_ptr = new KeyboardsDB ();
 		territories_db_ptr = new TerritoriesDB ();
 		languages_db_ptr = new LanguagesDB ();
@@ -546,6 +546,10 @@ namespace langtable {
 		thread1.join ();
 		thread2.join ();
 		thread3.join ();
+	}
+
+	public int main (string[] args) {
+		init ();
 
 		KeyboardsDB keyboards_db = keyboards_db_ptr;
 		TerritoriesDB territories_db = territories_db_ptr;
