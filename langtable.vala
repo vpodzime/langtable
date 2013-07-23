@@ -481,18 +481,43 @@ namespace langtable {
 		}
 	}
 
-	private void parse_file (Xml.SAXHandler handler, void* driver, string fpath) {
-		string real_path = fpath;
+	private class FileParser : GLib.Object {
+		private Xml.SAXHandler handler;
+		private string real_path;
+		private void* driver;
 
-		if (!FileUtils.test (real_path, FileTest.EXISTS)) {
-			if (FileUtils.test (real_path + ".gz", FileTest.EXISTS))
-				real_path += ".gz";
-			else
-				// raise exception instead or return bool?
-				return;
+		public FileParser (Xml.startElementSAXFunc start,
+						   Xml.endElementSAXFunc end,
+						   Xml.charactersSAXFunc chars,
+						   void* driver,
+						   string fpath) {
+
+			handler = Xml.SAXHandler ();
+			handler.startElement = start;
+			handler.endElement = end;
+			handler.characters = chars;
+
+			this.driver = driver;
+
+			real_path = fpath;
+
+			if (!FileUtils.test (real_path, FileTest.EXISTS)) {
+				if (FileUtils.test (real_path + ".gz", FileTest.EXISTS))
+					real_path += ".gz";
+				else
+					real_path = "";
+			}
 		}
 
-		handler.user_parse_file (driver, real_path);
+		public bool parse () {
+			if (real_path == "")
+				return false;
+			else
+				handler.user_parse_file (driver, real_path);
+
+			// successfully parsed
+			return true;
+		}
 	}
 
 	public int main (string[] args) {
@@ -500,31 +525,27 @@ namespace langtable {
 		territories_db_ptr = new TerritoriesDB ();
 		languages_db_ptr = new LanguagesDB ();
 
-		var handler = Xml.SAXHandler ();
-
 		var kb_driver = new KeyboardParsingDriver ();
 		var ter_driver = new TerritoryParsingDriver ();
 		var lang_driver = new LanguageParsingDriver ();
 
-		handler.startElement = keyboardStartElement;
-		handler.endElement = keyboardEndElement;
-		handler.characters = keyboardCharacters;
+		var keyb_parser = new FileParser (keyboardStartElement, keyboardEndElement,
+										  keyboardCharacters, kb_driver,
+										  "/usr/share/langtable/keyboards.xml");
+		var ter_parser = new FileParser (territoryStartElement, territoryEndElement,
+										 territoryCharacters, ter_driver,
+										 "/usr/share/langtable/territories.xml");
+		var lang_parser = new FileParser (languageStartElement, languageEndElement,
+										  languageCharacters, lang_driver,
+										  "/usr/share/langtable/languages.xml");
 
-		parse_file (handler, kb_driver, "/usr/share/langtable/keyboards.xml");
+		Thread<bool> thread1 = new Thread<bool> ("KeybThread", keyb_parser.parse);
+		Thread<bool> thread2 = new Thread<bool> ("TerThread", ter_parser.parse);
+		Thread<bool> thread3 = new Thread<bool> ("LangThread", lang_parser.parse);
 
-		handler = Xml.SAXHandler ();
-		handler.startElement = territoryStartElement;
-		handler.endElement = territoryEndElement;
-		handler.characters = territoryCharacters;
-
-		parse_file (handler, ter_driver, "/usr/share/langtable/territories.xml");
-
-		handler = Xml.SAXHandler ();
-		handler.startElement = languageStartElement;
-		handler.endElement = languageEndElement;
-		handler.characters = languageCharacters;
-
-		parse_file (handler, lang_driver, "/usr/share/langtable/languages.xml");
+		thread1.join ();
+		thread2.join ();
+		thread3.join ();
 
 		KeyboardsDB keyboards_db = keyboards_db_ptr;
 		TerritoriesDB territories_db = territories_db_ptr;
