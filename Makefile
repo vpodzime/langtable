@@ -4,6 +4,14 @@ DEBUG=
 PWD := $(shell pwd)
 SRCDIR=$(PWD)
 
+vala-bin:
+	valac --pkg=libxml-2.0 --pkg=gee-0.8 langtable.vala
+
+vala-lib:
+	valac -X -fPIC -X -shared --pkg=libxml-2.0 --pkg=gee-0.8 --library=liblangtable \
+		--gir=langtable-0.1.gir -o liblangtable.so langtable.vala
+	g-ir-compiler --shared-library=liblangtable.so --output=langtable-0.1.typelib langtable-0.1.gir
+
 install:
 	perl -pi -e "s,_datadir = '(.*)',_datadir = '$(DATADIR)'," langtable.py
 	DISTUTILS_DEBUG=$(DEBUG) python ./setup.py install --prefix=$(DESTDIR) --install-data=$(DATADIR)
