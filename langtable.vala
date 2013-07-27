@@ -16,10 +16,28 @@ namespace langtable {
 	private class LanguagesDB: HashMap<string, LanguagesDBitem> {
 	}
 
-	// cannot create instances here, use pointers instead
-	private KeyboardsDB* keyboards_db_ptr;
-	private TerritoriesDB* territories_db_ptr;
-	private LanguagesDB* languages_db_ptr;
+	private struct RankedItem {
+		public string value;
+		public uint32 rank;
+
+		public RankedItem (string value, uint32 rank) {
+			this.value = value;
+			this.rank = rank;
+		}
+	}
+
+	private enum LocFields {
+		lang,
+		script,
+		terr,
+	}
+
+	// cannot create instances here, just declare
+	private KeyboardsDB keyboards_db;
+	private TerritoriesDB territories_db;
+	private LanguagesDB languages_db;
+
+	private Regex locale_regex;
 
 	/***************** keyboards.xml parsing *****************/
 	private enum KeyboardFields {
@@ -101,7 +119,6 @@ namespace langtable {
 
 	private void keyboardEndElement (void* data, string name) {
 		KeyboardParsingDriver driver = data as KeyboardParsingDriver;
-		HashMap<string, KeyboardsDBitem> keyboards_db = keyboards_db_ptr;
 
 		switch (name) {
 		case "ascii":
@@ -236,7 +253,6 @@ namespace langtable {
 
 	private void territoryEndElement (void* data, string name) {
 		TerritoryParsingDriver driver = data as TerritoryParsingDriver;
-		HashMap<string, TerritoriesDBitem> territories_db = territories_db_ptr;
 
 		switch (name) {
 		case "territory":
@@ -404,7 +420,6 @@ namespace langtable {
 
 	private void languageEndElement (void* data, string name) {
 		LanguageParsingDriver driver = data as LanguageParsingDriver;
-		HashMap<string, LanguagesDBitem> languages_db = languages_db_ptr;
 
 		switch (name) {
 		case "language":
@@ -520,10 +535,352 @@ namespace langtable {
 		}
 	}
 
+	/**
+	   Parses languageId and if it contains a valid ICU locale id,
+	   returns the values for language, script, and territory found
+	   in languageId instead of the original values given.
+
+	   Before parsing, it replaces glibc names for scripts like “latin”
+	   with the iso-15924 script names like “Latn”, both in the
+	   languageId and the scriptId parameter. I.e.  language id like
+	   “sr_latin_RS” is accepted as well and treated the same as
+	   “sr_Latn_RS”.
+	*/
+	public string[] _parse_and_split_languageId (string languageId,
+												  string scriptId,
+												  string territoryId) {
+		string ICUscriptId = scriptId;
+		string ICUlanguageId = languageId;
+		string ICUterritoryId = territoryId;
+		string[,] scripts = {{"latin", "Latn"},
+							 {"iqtelif", "Latn"}, // Tatar, tt_RU.UTF-8@iqtelif,
+							 // http://en.wikipedia.org/wiki/User:Ultranet/%C4%B0QTElif
+							 {"cyrillic", "Cyrl"},
+							 {"devanagari", "Deva"}};
+
+		for (uint8 i=0; i < 4; i++ ) {
+			if (ICUscriptId != null)
+                ICUscriptId = ICUscriptId.replace(scripts[i,0], scripts[i,1]);
+			if (ICUlanguageId != null)
+			    ICUlanguageId = ICUlanguageId.replace(scripts[i,0], scripts[i,1]);
+		}
+
+		if (ICUlanguageId == null)
+            return {"", "", ""};
+
+	    MatchInfo info;
+		var matched = locale_regex.match (ICUlanguageId, 0, out info);
+
+		if (!matched) {
+			// TODO: log error here!
+			return {"", "", ""};
+		}
+
+		string? lang = info.fetch_named ("language");
+		string? script = info.fetch_named ("script");
+		string? territory = info.fetch_named ("territory");
+
+		if (lang != null)
+		    ICUlanguageId = lang;
+		if (script != null)
+			ICUscriptId = script;
+		if (territory != null)
+     		ICUterritoryId = territory;
+
+		return {ICUlanguageId, ICUscriptId, ICUterritoryId};
+	}
+
+	private RankedItem[] ranked_map_to_ranked_list (StringRankMap map, bool reverse) {
+		RankedItem[] ret = {};
+		var entry_set = map.entries;
+		var ranked_list = new ArrayList<Map.Entry<string, uint32>> ();
+		int8 reverse_factor = reverse ? -1 : 1;
+
+		ranked_list.add_all(entry_set);
+		ranked_list.sort((a, b) => {
+				if (a.value < b.value)
+					return -1 * reverse_factor;
+				if (a.value == b.value)
+					return 0;
+				else
+					return 1 * reverse_factor;
+			});
+
+		foreach (var entry in ranked_list)
+			ret += RankedItem (entry.key, entry.value);
+
+		return ret;
+	}
+
+	private string[] ranked_list_to_list (RankedItem[] list) {
+		string[] ret = {};
+
+		foreach (var item in list)
+			ret += item.value;
+
+		return ret;
+	}
+
+	private RankedItem[] make_ranked_list_concise (RankedItem[] list, uint32 cut_off_factor) {
+		RankedItem[] ret = {};
+		uint i = 0;
+
+		if (list.length > 0)
+			ret += list[0];
+
+		for (i=0; i < list.length - 2; i++)
+			if (list[i].rank / list[i+1].rank > cut_off_factor) {
+				ret += list[i];
+			}
+
+		if (list.length > 1 && list[i].rank / list[i+1].rank > cut_off_factor)
+			ret += list[i+1];
+
+		return ret;
+	}
+
+	/**
+	   Returns True if the keyboard layout with that id can be used to
+	   type ASCII, returns false if the keyboard layout can not be used
+	   to type ASCII or if typing ASCII with that keyboard layout is
+	   difficult.
+	*/
+	public bool supports_ascii (string? keyboardId) {
+		if (keyboardId in keyboards_db)
+			return keyboards_db[keyboardId].ascii;
+
+		return false;
+	}
+
+	public string territory_name (string? territoryId, string? languageIdQuery,
+								  string? scriptIdQuery, string? territoryIdQuery) {
+
+		string? langIdQ;
+		string? scriptIdQ;
+		string? terrIdQ;
+
+		string[] loc_fields = _parse_and_split_languageId (languageIdQuery,
+														   scriptIdQuery,
+														   territoryIdQuery);
+		langIdQ = loc_fields[LocFields.lang];
+		scriptIdQ = loc_fields[LocFields.script];
+		terrIdQ = loc_fields[LocFields.terr];
+
+		if (!(territoryId in territories_db))
+			return "";
+
+		string ICUlocaleId;
+		if (langIdQ != "" && scriptIdQ != "" && terrIdQ != "") {
+			ICUlocaleId = langIdQ + "_" + scriptIdQ + "_" + terrIdQ;
+			if (ICUlocaleId in territories_db[territoryId].names)
+				return territories_db[territoryId].names[ICUlocaleId];
+		}
+
+		if (langIdQ != "" && scriptIdQ != "") {
+			ICUlocaleId = langIdQ + "_" + scriptIdQ;
+			if (ICUlocaleId in territories_db[territoryId].names)
+				return territories_db[territoryId].names[ICUlocaleId];
+		}
+
+		if (langIdQ != "" && terrIdQ != "") {
+			ICUlocaleId = langIdQ + "_" + terrIdQ;
+			if (ICUlocaleId in territories_db[territoryId].names)
+				return territories_db[territoryId].names[ICUlocaleId];
+		}
+
+		if (langIdQ != "") {
+			ICUlocaleId = langIdQ;
+			if (ICUlocaleId in territories_db[territoryId].names)
+				return territories_db[territoryId].names[ICUlocaleId];
+		}
+
+		return "";
+	}
+
+	public string language_name (string? languageId, string? scriptId,
+								 string? territoryId, string? languageIdQuery,
+								 string? scriptIdQuery, string? territoryIdQuery) {
+		string? langId;
+		string? scrId;
+		string? terrId;
+		string? langIdQ;
+		string? scrIdQ;
+		string? terrIdQ;
+
+		string[] loc_fields = _parse_and_split_languageId (languageId,
+														   scriptId,
+														   territoryId);
+		langId = loc_fields[LocFields.lang];
+		scrId = loc_fields[LocFields.script];
+		terrId = loc_fields[LocFields.terr];
+
+		loc_fields = _parse_and_split_languageId (languageIdQuery,
+												  scriptIdQuery,
+												  territoryIdQuery);
+		langIdQ = loc_fields[LocFields.lang];
+		scrIdQ = loc_fields[LocFields.script];
+		terrIdQ = loc_fields[LocFields.terr];
+
+		if (langIdQ == "") {
+			// get the endonym
+			langIdQ = langId;
+			scrIdQ = scrId;
+			terrIdQ = terrId;
+		}
+
+		string ICUlocaleId;
+		string ICUlocaleIdQ;
+		if (langId != "" && scrId != "" && terrId != "") {
+			ICUlocaleId = langId + "_" + scrId + "_" + terrId;
+			if (ICUlocaleId in languages_db) {
+				if (langIdQ != "" && scrIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && scrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "") {
+					ICUlocaleIdQ = langIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+			}
+		}
+		if (langId != "" && scrId != "") {
+			ICUlocaleId = langId + "_" + scrId;
+			if (ICUlocaleId in languages_db) {
+				if (langIdQ != "" && scrIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && scrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "") {
+					ICUlocaleIdQ = langIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+			}
+		}
+		if (langId != "" && terrId != "") {
+			ICUlocaleId = langId + "_" + terrId;
+			if (ICUlocaleId in languages_db) {
+				if (langIdQ != "" && scrIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && scrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "") {
+					ICUlocaleIdQ = langIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+			}
+			string lname = language_name (langId, "", "", langIdQ, scrIdQ, terrIdQ);
+			string tname = territory_name (terrId, langIdQ, scrIdQ, terrIdQ);
+
+			if (lname != "" && tname != "")
+				return lname + " (" + tname + ")";
+		}
+		if (langId != "") {
+			ICUlocaleId = langId;
+			if (ICUlocaleId in languages_db) {
+				if (langIdQ != "" && scrIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && scrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + scrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "" && terrIdQ != "") {
+					ICUlocaleIdQ = langIdQ + "_" + terrIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+				if (langIdQ != "") {
+					ICUlocaleIdQ = langIdQ;
+					if (ICUlocaleIdQ in languages_db[ICUlocaleId].names)
+						return languages_db[ICUlocaleId].names[ICUlocaleIdQ];
+				}
+			}
+		}
+
+		return "";
+	}
+
+	private bool has_terr_name (TerritoriesDBitem item, string name) {
+		foreach (var entry in item.names.entries)
+			if (name == entry.value)
+				return true;
+
+		return false;
+	}
+
+	public string territoryId (string territoryName) {
+		if (territoryName == "")
+			return "";
+
+		foreach (var terr_entry in territories_db.entries)
+			if (has_terr_name (terr_entry.value, territoryName))
+				return terr_entry.key;
+
+		return "";
+	}
+
+	private bool has_lang_name (LanguagesDBitem item, string name) {
+		foreach (var entry in item.names.entries)
+			if (name == entry.value)
+				return true;
+
+		return false;
+	}
+
+	public string languageId (string languageName) {
+		if (languageName == "")
+			return "";
+
+		foreach (var lang_entry in languages_db.entries)
+			if (has_lang_name (lang_entry.value, languageName))
+				return lang_entry.key;
+
+		return "";
+	}
+
 	public void init () {
-		keyboards_db_ptr = new KeyboardsDB ();
-		territories_db_ptr = new TerritoriesDB ();
-		languages_db_ptr = new LanguagesDB ();
+		keyboards_db = new KeyboardsDB ();
+		territories_db = new TerritoriesDB ();
+		languages_db = new LanguagesDB ();
 
 		var kb_driver = new KeyboardParsingDriver ();
 		var ter_driver = new TerritoryParsingDriver ();
@@ -543,6 +900,27 @@ namespace langtable {
 		Thread<bool> thread2 = new Thread<bool> ("TerThread", ter_parser.parse);
 		Thread<bool> thread3 = new Thread<bool> ("LangThread", lang_parser.parse);
 
+		locale_regex = new Regex (
+			// language must be 2 or 3 lower case letters:
+			"^(?P<language>[a-z]{2,3}" +
+			// language is only valid if
+			"(?=$|@" + // locale string ends here or only options follow
+			"|_[A-Z][a-z]{3}(?=$|@|_[A-Z]{2}(?=$|@))" + // valid script follows
+			"|_[A-Z]{2}(?=$|@)" + // valid territory follows
+			"))" +
+			// script must be 1 upper case letter followed by
+			// 3 lower case letters:
+			"(?:_(?P<script>[A-Z][a-z]{3})" +
+			// script is only valid if
+			"(?=$|@" + // locale string ends here or only options follow
+			"|_[A-Z]{2}(?=$|@)" + // valid territory follows
+			")){0,1}" +
+			// territory must be 2 upper case letters:
+			"(?:_(?P<territory>[A-Z]{2})" +
+			// territory is only valid if
+			"(?=$|@" + // locale string ends here or only options follow
+			")){0,1}");
+
 		thread1.join ();
 		thread2.join ();
 		thread3.join ();
@@ -550,10 +928,6 @@ namespace langtable {
 
 	public int main (string[] args) {
 		init ();
-
-		KeyboardsDB keyboards_db = keyboards_db_ptr;
-		TerritoriesDB territories_db = territories_db_ptr;
-		LanguagesDB languages_db = languages_db_ptr;
 
 		foreach (var entry in keyboards_db.entries) {
 			stdout.printf ("Have keyboard '%s': '%s'\n", entry.key, entry.value.description);
